@@ -7,7 +7,11 @@ from enum import IntEnum
 from dataclasses import dataclass
 from typing import TypeAlias
 import time
+import argparse
+from pathlib import Path
 
+import pypcd4
+import plotly.graph_objects as go
 from numpy.typing import NDArray
 
 Position: TypeAlias = tuple[float, float, float]
@@ -375,13 +379,77 @@ def pos_to_cell_idx(d: float, h: float, w: float, cell_size: float) -> tuple[int
     return (int(d / cell_size), int(h / cell_size), int(w / cell_size))
 
 
-def make_scene(D: int = 40, H: int = 40, W: int = 40, cell_size: float = 1.0) -> tuple[NDArray[np.uint8], Position]:
+def make_scene_from_pcd(
+    pcd_path: Path,
+    grid_shape_vox: tuple[int, int, int],
+    cell_size: float,
+    grid_origin_m: Position,
+) -> NDArray[np.uint8]:
+    """Creates an occupancy grid from a PCD file.
+
+    The grid's voxel (0,0,0) corresponds to the real-world `grid_origin_m` coordinate.
+
+    Args:
+        pcd_path: Path to a .pcd file.
+        grid_shape_vox: The desired (D, H, W) shape of the grid in voxels.
+        cell_size: The size of a single voxel in meters.
+        grid_origin_m: The (z, y, x) world coordinate that corresponds to voxel (0,0,0).
+
+    Returns:
+        An occupancy grid with points from the PCD file marked as occupied.
+    """
+    print(f"- Loading points from: {pcd_path}")
+    pc = pypcd4.PointCloud.from_path(pcd_path)
+    occ = np.zeros(grid_shape_vox, dtype=np.uint8)
+
+    # pypcd gives points in [x, y, z] order, units are in meters.
+    points_xyz = pc.numpy()[:, :3]
+    points_xyz[:, 2] += 2  # input pcd was shifted down 2 meters
+    print(f"  - Loaded {points_xyz.shape[0]} points.")
+
+    # grid_origin_m is (z, y, x) in meters. Convert it to (x, y, z) for vector math.
+    grid_origin_m_xyz = np.array([grid_origin_m[2], grid_origin_m[1], grid_origin_m[0]])
+
+    # 1. Translate points to be relative to the grid's origin. Coordinates are still in meters.
+    points_relative_to_origin_m = points_xyz - grid_origin_m_xyz
+
+    # 2. Convert the relative meter coordinates into integer voxel indices.
+    indices_xyz = np.floor(points_relative_to_origin_m / cell_size).astype(int)
+
+    # 3. Create a boolean mask for points that fall within the grid boundaries.
+    # Grid shape is (D, H, W), which corresponds to (z, y, x) indices.
+    D, H, W = grid_shape_vox
+    valid_mask = (
+        (indices_xyz[:, 0] >= 0) & (indices_xyz[:, 0] < W) &  # Check X against W
+        (indices_xyz[:, 1] >= 0) & (indices_xyz[:, 1] < H) &  # Check Y against H
+        (indices_xyz[:, 2] >= 0) & (indices_xyz[:, 2] < D)    # Check Z against D
+    )
+
+    # 4. Filter to get only the valid indices (still in x,y,z order).
+    valid_indices_xyz = indices_xyz[valid_mask]
+
+    if valid_indices_xyz.shape[0] == 0:
+        print("  - WARNING: No points from the PCD file fall within the specified grid volume.")
+        return occ
+
+    print(f"  - {valid_indices_xyz.shape[0]} points fall within the grid volume.")
+
+    # 5. Use the valid indices to set the corresponding voxels to 1 (occupied).
+    # The occ grid is indexed by (z, y, x), so we must supply the columns in that order.
+    z_indices = valid_indices_xyz[:, 2]
+    y_indices = valid_indices_xyz[:, 1]
+    x_indices = valid_indices_xyz[:, 0]
+    occ[z_indices, y_indices, x_indices] = 1
+
+    return occ
+
+def make_scene(D_m: float = 40.0, H_m: float = 40.0, W_m: float = 40.0, cell_size: float = 1.0) -> tuple[NDArray[np.uint8], Position]:
     """Creates an example scene with obstacles and a sensor position.
 
     Args:
-        D: The depth of the grid in world units.
-        H: The height of the grid in world units.
-        W: The width of the grid in world units.
+        D_m: The depth of the grid in meters.
+        H_m: The height of the grid in meters.
+        W_m: The width of the grid in meters.
         cell_size: The size of a single voxel in meters.
 
     Returns:
@@ -389,14 +457,14 @@ def make_scene(D: int = 40, H: int = 40, W: int = 40, cell_size: float = 1.0) ->
         - occ: A (D, H, W) occupancy grid with obstacles.
         - sensor: The (z, y, x) sensor position in continuous voxel coordinates.
     """
-    # Scene Geometry Constants (in world units)
+    # Scene Geometry Constants (in meters)
     WALL_X_POS = 30.0
     BOX_Z_RANGE = (15.0, 36.0)
     BOX_Y_RANGE = (15.0, 30.0)
     BOX_X_RANGE = (20.0, 56.0)
-    SENSOR_POSITION = (min(32.0, D - 1.0), min(32.0, H - 1.0), min(8.0, W - 1.0))
+    SENSOR_POSITION = (min(32.0, D_m - cell_size), min(32.0, H_m - cell_size), min(8.0, W_m - cell_size))
 
-    grid_shape = pos_to_cell_idx(D, H, W, cell_size)
+    grid_shape = pos_to_cell_idx(D_m, H_m, W_m, cell_size)
     occ = np.zeros(grid_shape, dtype=np.uint8)
 
     wall_x_idx = int(WALL_X_POS / cell_size)
@@ -449,6 +517,90 @@ def sample_fov_dirs(
     dirs /= norms
     return dirs
 
+
+def plot_3d_scene_web(
+    occ: NDArray[np.uint8],
+    sensor_zyx: Position,
+    dirs: NDArray[np.float32],
+    max_range: float,
+    num_rays_to_plot: int = 50,
+    out_path: str = "scene_3d_view.html",
+) -> None:
+    """Creates and saves an interactive 3D web-based view of the scene using Plotly."""
+    # The simulation uses (z, y, x) numpy indexing.
+    # Plotly uses a standard Cartesian (x, y, z) coordinate system.
+    # We must consistently swap the axes when creating plotable objects.
+
+    plot_data = []
+
+    # 1. Trace for the occupied voxels (PCD)
+    occ_indices_zyx = np.argwhere(occ == 1)
+    if occ_indices_zyx.size > 0:
+        # Swap axes from (z, y, x) to (x, y, z) for plotting
+        occ_indices_xyz = occ_indices_zyx[:, ::-1]
+        pcd_trace = go.Scatter3d(
+            x=occ_indices_xyz[:, 0], y=occ_indices_xyz[:, 1], z=occ_indices_xyz[:, 2],
+            mode='markers',
+            marker=dict(size=2, color='black', opacity=0.7),
+            name='Occupied Voxels (PCD)'
+        )
+        plot_data.append(pcd_trace)
+
+    # 2. Trace for the sensor position
+    # Swap axes from (z, y, x) to (x, y, z) for plotting
+    sensor_xyz = np.array([sensor_zyx[2], sensor_zyx[1], sensor_zyx[0]])
+    sensor_trace = go.Scatter3d(
+        x=[sensor_xyz[0]], y=[sensor_xyz[1]], z=[sensor_xyz[2]],
+        mode='markers',
+        marker=dict(size=8, color='yellow', symbol='diamond', line=dict(color='black', width=2)),
+        name='Sensor Position'
+    )
+    plot_data.append(sensor_trace)
+
+    # 3. Trace for the FOV rays
+    # Subsample the rays to avoid creating a huge HTML file and cluttering the view
+    rng = np.random.default_rng(0)
+    num_rays_to_plot = min(num_rays_to_plot, dirs.shape[0])
+    ray_indices = rng.choice(dirs.shape[0], size=num_rays_to_plot, replace=False)
+    sampled_dirs_xyz = dirs[ray_indices] # Dirs are already in (x, y, z)
+
+    # To draw many separate lines efficiently in Plotly, we build a single trace
+    # and separate the line segments with `None` values.
+    ray_x, ray_y, ray_z = [], [], []
+    for i in range(num_rays_to_plot):
+        start_point = sensor_xyz
+        end_point = sensor_xyz + sampled_dirs_xyz[i] * max_range
+        
+        ray_x.extend([start_point[0], end_point[0], None])
+        ray_y.extend([start_point[1], end_point[1], None])
+        ray_z.extend([start_point[2], end_point[2], None])
+    
+    ray_trace = go.Scatter3d(
+        x=ray_x, y=ray_y, z=ray_z,
+        mode='lines',
+        line=dict(color='cyan', width=1),
+        name='FOV Rays'
+    )
+    plot_data.append(ray_trace)
+
+    fig = go.Figure(data=plot_data)
+    fig.update_layout(
+        title='3D Scene Visualization',
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y',
+            zaxis_title='Z',
+            aspectratio=dict(x=1, y=1, z=1),
+            aspectmode='data', # Ensures proportions are correct
+            camera_eye=dict(x=1.5, y=1.5, z=1.5)
+        ),
+        legend_orientation="h"
+    )
+
+    print(f"\n[ 3D VISUALIZATION ]")
+    print(f"- Saving interactive 3D scene to: {out_path}")
+    fig.write_html(out_path)
+    print("-  -> Open this file in a web browser to view the scene.")
 
 def plot_slice(
         occ: NDArray[np.uint8],
@@ -618,15 +770,76 @@ if __name__ == "__main__":
     if not cuda.is_available():
         raise RuntimeError("Numba CUDA is not available. Example requires a CUDA-capable GPU and CUDA toolkit.")
 
-    print("===== Voxel-Based Visibility Analysis =====")
+    parser = argparse.ArgumentParser(description="Voxel-Based Visibility Analysis")
+    parser.add_argument(
+        "--pcd_file", type=Path, default=None,
+        help="Path to a .pcd file to use for the occupancy grid. If not provided, a default scene is generated."
+    )
+    parser.add_argument(
+        "--grid_dims_m", type=str, default="40,40,40",
+        help="Grid dimensions (depth,height,width) in meters as 'D,H,W' (z,y,x)."
+    )
+    parser.add_argument(
+        "--grid_origin_m", type=str, default="-20,-20,-20",
+        help="World coordinate (z,y,x) in meters that maps to grid voxel (0,0,0). Used only with --pcd_file."
+    )
+    parser.add_argument(
+        "--sensor_pos_m", type=str, default="20,20,20",
+        help="Sensor position (z,y,x) in meters."
+    )
+    parser.add_argument(
+        "--cell_size", type=float, default=CELL_SIZE,
+        help="Size of a single voxel in meters."
+    )
+    parser.add_argument(
+        "--plot_3d_web", action="store_true",
+        help="If set, generates an interactive 3D plot of the scene as an HTML file (scene_3d_view.html)."
+    )
+    args = parser.parse_args()
 
+    print("===== Voxel-Based Visibility Analysis =====")
     print("\n[ SETUP ]")
     start_setup_time = time.time()
-    occ, sensor = make_scene(cell_size=CELL_SIZE)
+
+    # --- Convert meter-based arguments to voxel-based coordinates ---
+    # User provides grid dimensions in meters, we calculate voxel shape
+    grid_dims_m = tuple(map(float, args.grid_dims_m.split(',')))
+    grid_shape_vox = pos_to_cell_idx(grid_dims_m[0], grid_dims_m[1], grid_dims_m[2], args.cell_size)
+
+    # User provides sensor position in meters, we convert to continuous voxel coordinates
+    sensor_pos_m = tuple(map(float, args.sensor_pos_m.split(',')))
+    sensor = (
+        sensor_pos_m[0] / args.cell_size,
+        sensor_pos_m[1] / args.cell_size,
+        sensor_pos_m[2] / args.cell_size,
+    )
+
+    if args.pcd_file:
+        if not args.pcd_file.exists():
+            raise FileNotFoundError(f"PCD file not found: {args.pcd_file}")
+
+        print(f"- Generating scene from PCD file: {args.pcd_file}")
+        grid_origin_m = tuple(map(float, args.grid_origin_m.split(',')))
+
+        occ = make_scene_from_pcd(
+            pcd_path=args.pcd_file,
+            grid_shape_vox=grid_shape_vox,
+            cell_size=args.cell_size,
+            grid_origin_m=grid_origin_m,
+        )
+    else:
+        print("- Generating default procedural scene.")
+        # The sensor position from the CLI (`--sensor_pos_m`) is used.
+        # We call make_scene to generate obstacles based on the grid dimensions.
+        occ, _ = make_scene(
+            D_m=grid_dims_m[0], H_m=grid_dims_m[1], W_m=grid_dims_m[2],
+            cell_size=args.cell_size
+        )
+
     scene_build_time = time.time() - start_setup_time
     print(f"- Scene Build Time:      {scene_build_time:.4f}s")
     print(f"  - Grid Shape:          {occ.shape}")
-    print(f"  - Cell Size:           {CELL_SIZE}m")
+    print(f"  - Cell Size:           {args.cell_size}m")
 
     start_ray_time = time.time()
     h_samples, v_samples = 900, 128
@@ -651,10 +864,16 @@ if __name__ == "__main__":
     
     # Define a consistent cluster for all demos
     cluster = np.zeros_like(occ, dtype=np.uint8)
-    z0, z1 = int(10 / CELL_SIZE), int(36 / CELL_SIZE)
-    y0, y1 = int(10 / CELL_SIZE), int(30 / CELL_SIZE)
-    x0, x1 = int(10 / CELL_SIZE), int(56 / CELL_SIZE)
-    cluster[z0:z1, y0:y1, x0:x1] = 1
+    if not args.pcd_file:
+        # This cluster definition is tuned for the default procedural scene
+        z0, z1 = int(10 / args.cell_size), int(36 / args.cell_size)
+        y0, y1 = int(10 / args.cell_size), int(30 / args.cell_size)
+        x0, x1 = int(10 / args.cell_size), int(56 / args.cell_size)
+        cluster[z0:z1, y0:y1, x0:x1] = 1
+    else:
+        # For PCD files, let's make the cluster the entire occupied space.
+        # This is useful for checking the visibility of the whole point cloud.
+        cluster = occ.copy()
 
     # --- WARMUP ---
     # First run includes a one-time JIT compilation cost. We run it once
@@ -669,7 +888,7 @@ if __name__ == "__main__":
     start_time = time.time()
     vis_grid, fov_grid = get_visibility_grid(
         occ, sensor, dirs,
-        max_range=40.0, cell_size=CELL_SIZE,
+        max_range=40.0, cell_size=args.cell_size,
         beam_config=beam_config, compute_fov_grid=True
     )
     full_time = time.time() - start_time
@@ -686,7 +905,7 @@ if __name__ == "__main__":
     start_plot_time = time.time()
     print("- Plotting slices (view slice*.png for results)...")
     if fov_grid is not None:
-        for z_idx in range(int(sensor[0]) - 40, int(sensor[0]) + 40, 5):
+        for z_idx in range(96, 108):
             if 0 <= z_idx < occ.shape[0]:
                 plot_slice(occ, vis_grid, fov_grid, cluster, z_idx=z_idx, sensor_zyx=sensor, out_path=f"slice_{z_idx}.png")
     plot_time = time.time() - start_plot_time
@@ -697,7 +916,7 @@ if __name__ == "__main__":
     start_time = time.time()
     vis_only_grid, no_fov_grid = get_visibility_grid(
         occ, sensor, dirs,
-        max_range=40.0, cell_size=CELL_SIZE,
+        max_range=40.0, cell_size=args.cell_size,
         beam_config=beam_config, compute_fov_grid=False
     )
     vis_only_time = time.time() - start_time
@@ -718,14 +937,14 @@ if __name__ == "__main__":
     
     # Batch with Vis + FOV
     start_time = time.time()
-    batch_results_full = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=CELL_SIZE, beam_config=beam_config, compute_fov_grid=True)
+    batch_results_full = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=True)
     batch_grid_time = time.time() - start_time
     avg_batch_grid_time = batch_grid_time / batch_size
     print(f"- Grid Comp Time (Vis+FOV):{batch_grid_time:>8.4f}s (Avg: {avg_batch_grid_time:.4f}s per item)")
     
     # Batch with Vis-Only
     start_time = time.time()
-    batch_results_vis_only = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=CELL_SIZE, beam_config=beam_config, compute_fov_grid=False)
+    batch_results_vis_only = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=False)
     batch_vis_only_time = time.time() - start_time
     avg_batch_vis_only_time = batch_vis_only_time / batch_size
     print(f"- Grid Comp Time (Vis-Only):{batch_vis_only_time:>7.4f}s (Avg: {avg_batch_vis_only_time:.4f}s per item)")
@@ -747,3 +966,12 @@ if __name__ == "__main__":
     print(f"| Cluster Visibility Check       | {single_cluster_time:>15.4f}s | {avg_batch_cluster_time:>18.4f}s |")
     print("---------------------------------------------------------------------")
     print("=====================================================================")
+
+    # --- DEMO 4: Interactive Web-Based 3D Visualization ---
+    if args.plot_3d_web:
+        plot_3d_scene_web(
+            occ=occ,
+            sensor_zyx=sensor,
+            dirs=dirs,
+            max_range=40.0, # Use the same max_range as Demo 1
+        )

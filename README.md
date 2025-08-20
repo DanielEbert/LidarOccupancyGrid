@@ -86,6 +86,12 @@ The output plot visualizes a 2D slice of the 3D world, with colors indicating th
 - **Light Red:** A voxel belonging to the target cluster that is occluded.
 - **Cyan:** A voxel belonging to the target cluster that is visible.
 
+PCD and 3D Visu Example:
+
+```bash
+python main.py --pcd_file sample.pcd --plot_3d_web && python -m http.server 8474
+```
+
 ## Future Work
 
 - package, and better api
