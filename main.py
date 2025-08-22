@@ -95,7 +95,7 @@ def raycast_kernel(occ: NDArray[np.uint8], visibility_grid: NDArray[np.int32], s
     step_z = 1 if dz > 0 else (-1 if dz < 0 else 0)
 
     if dx == 0.0:
-        tMaxX, tDeltaX = 1e30, 1e30
+        tMaxX, tDeltaX = math.inf, math.inf
     else:
         if dx > 0:
             tMaxX = ((math.floor(sx) + 1.0 - sx) * cell_size) / dx
@@ -104,7 +104,7 @@ def raycast_kernel(occ: NDArray[np.uint8], visibility_grid: NDArray[np.int32], s
         tDeltaX = cell_size / abs(dx)
 
     if dy == 0.0:
-        tMaxY, tDeltaY = 1e30, 1e30
+        tMaxY, tDeltaY = math.inf, math.inf
     else:
         if dy > 0:
             tMaxY = ((math.floor(sy) + 1.0 - sy) * cell_size) / dy
@@ -113,7 +113,7 @@ def raycast_kernel(occ: NDArray[np.uint8], visibility_grid: NDArray[np.int32], s
         tDeltaY = cell_size / abs(dy)
 
     if dz == 0.0:
-        tMaxZ, tDeltaZ = 1e30, 1e30
+        tMaxZ, tDeltaZ = math.inf, math.inf
     else:
         if dz > 0:
             tMaxZ = ((math.floor(sz) + 1.0 - sz) * cell_size) / dz
@@ -219,7 +219,7 @@ def dilate_visibility_kernel(
     sx, sy, sz = sensor_pos[0], sensor_pos[1], sensor_pos[2]
     dist_vox_sq = float32((vx - sx)**2 + (vy - sy)**2 + (vz - sz)**2)
     dist_m = math.sqrt(dist_vox_sq) * cell_size
-    divergence_rad = divergence_deg * (3.141592653589793 / 180.0)
+    divergence_rad = divergence_deg * (math.pi / 180.0)
     r_m = max(min_radius_m, dist_m * tan_impl_device(divergence_rad * 0.5))
     r = ceil_impl_device(r_m / cell_size) + extra_vox_inflate
 
@@ -255,36 +255,34 @@ def get_visibility_grid(
 
     raycast_kernel[*cudagrid((dirs.shape[0],))](d_occ, d_visibility_grid, d_sensor, d_dirs, float32(max_range), float32(cell_size))
 
-    if beam_config.use_dilation:
-        d_dilated_visibility_grid = cuda.device_array_like(d_visibility_grid)
-        dilate_visibility_kernel[*cudagrid(occ.shape)](
-            d_visibility_grid, d_dilated_visibility_grid, d_occ, d_sensor,
-            float32(cell_size), float32(beam_config.divergence_deg),
-            float32(beam_config.min_radius_m), beam_config.extra_vox_inflate
-        )
-        d_dilated_visibility_grid.copy_to_host(visibility_grid)
-    else:
-        d_visibility_grid.copy_to_host(visibility_grid)
+    if not beam_config.use_dilation:
+        return d_visibility_grid.copy_to_host()
 
-    return visibility_grid
+    d_dilated_visibility_grid = cuda.device_array_like(d_visibility_grid)
+    dilate_visibility_kernel[*cudagrid(occ.shape)](
+        d_visibility_grid, d_dilated_visibility_grid, d_occ, d_sensor,
+        float32(cell_size), float32(beam_config.divergence_deg),
+        float32(beam_config.min_radius_m), beam_config.extra_vox_inflate
+    )
+    return d_dilated_visibility_grid.copy_to_host()
 
 
-def get_visibility_grid_batch(
-        occ_sensor_list: list[tuple[NDArray[np.uint8], NDArray[np.float32]]],
-        dirs: NDArray[np.float32],
-        max_range: float = 100.0,
-        cell_size: float = 1.0,
-        beam_config: BeamConfig = BeamConfig(),
-) -> list[NDArray[np.int32]]:
-    """Computes visibility grids for a batch of occupancy grids and sensor positions."""
-    return [get_visibility_grid(
-                occ,
-                sensor,
-                dirs,
-                max_range=max_range,
-                cell_size=cell_size,
-                beam_config=beam_config
-             ) for occ, sensor in occ_sensor_list]
+def get_visibility_grid_batch(occ_sensor_list, dirs, max_range=100.0, 
+                                       cell_size=1.0, beam_config=BeamConfig()):
+    """Process batch using CUDA streams for overlapping computation"""
+    # set min based on available gpu memory
+    streams = [cuda.stream() for _ in range(min(8, len(occ_sensor_list)))]
+    results = []
+
+    for i, (occ, sensor) in enumerate(occ_sensor_list):
+        stream = streams[i % len(streams)]
+        with stream.auto_synchronize():
+            result = get_visibility_grid(occ, sensor, dirs, max_range, 
+                                       cell_size, beam_config)
+            results.append(result)
+    
+    cuda.synchronize()
+    return results
 
 
 def pos_to_cell_idx(d: float, h: float, w: float, cell_size: float) -> tuple[int, int, int]:
@@ -325,48 +323,6 @@ def make_scene_from_pcd(
     
     occ[tuple(valid_indices_xyz.T)] = 1
     return occ
-
-def make_scene(D_m: float = 40.0, H_m: float = 40.0, W_m: float = 40.0, cell_size: float = 1.0) -> tuple[NDArray[np.uint8], Position]:
-    """Creates an example scene with obstacles and a sensor position.
-
-    Args:
-        D_m: The depth of the grid in meters.
-        H_m: The height of the grid in meters.
-        W_m: The width of the grid in meters.
-        cell_size: The size of a single voxel in meters.
-
-    Returns:
-        A tuple containing:
-        - occ: A (D, H, W) occupancy grid with obstacles.
-        - sensor: The (z, y, x) sensor position in continuous voxel coordinates.
-    """
-    # Scene Geometry Constants (in meters)
-    WALL_X_POS = 30.0
-    BOX_Z_RANGE = (15.0, 36.0)
-    BOX_Y_RANGE = (15.0, 30.0)
-    BOX_X_RANGE = (20.0, 56.0)
-    SENSOR_POSITION = (min(32.0, D_m - cell_size), min(32.0, H_m - cell_size), min(8.0, W_m - cell_size))
-
-    grid_shape = pos_to_cell_idx(D_m, H_m, W_m, cell_size)
-    occ = np.zeros(grid_shape, dtype=np.uint8)
-
-    wall_x_idx = int(WALL_X_POS / cell_size)
-    if wall_x_idx < grid_shape[2]:
-        occ[:, :, wall_x_idx] = 1
-
-    # box obstacle
-    z0_idx, z1_idx = int(BOX_Z_RANGE[0] / cell_size), int(BOX_Z_RANGE[1] / cell_size)
-    y0_idx, y1_idx = int(BOX_Y_RANGE[0] / cell_size), int(BOX_Y_RANGE[1] / cell_size)
-    x0_idx, x1_idx = int(BOX_X_RANGE[0] / cell_size), int(BOX_X_RANGE[1] / cell_size)
-    if z0_idx < z1_idx and y0_idx < y1_idx and x0_idx < x1_idx:
-        occ[z0_idx:z1_idx, y0_idx:y1_idx, x0_idx:x1_idx] = 1
-
-    sensor_idx = (
-        SENSOR_POSITION[0] / cell_size,
-        SENSOR_POSITION[1] / cell_size,
-        SENSOR_POSITION[2] / cell_size,
-    )
-    return occ, sensor_idx
 
 
 def sample_fov_dirs(
@@ -629,15 +585,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--grid_dims_m", type=str, default="40,40,40",
-        help="Grid dimensions (width,depth,height) in meters as 'W,D,H' (x,y,z)."
+        help="Grid dimensions in meters as 'Width,Depth,Height' (X,Y,Z)."
+    )
+    parser.add_argument(
+        "--sensor_pos_m", type=str, default="20,20,20",
+        help="Sensor position in world coordinates (X,Y,Z) in meters."
     )
     parser.add_argument(
         "--grid_origin_m", type=str, default="-20,-20,-20",
         help="World coordinate (x,y,z) in meters that maps to grid voxel (0,0,0). Used only with --pcd_file."
-    )
-    parser.add_argument(
-        "--sensor_pos_m", type=str, default="20,20,20",
-        help="Sensor position (x,y,z) in meters."
     )
     parser.add_argument(
         "--cell_size", type=float, default=0.2,
@@ -656,22 +612,15 @@ if __name__ == "__main__":
 
     sensor = np.array(list(map(float, args.sensor_pos_m.split(',')))) / args.cell_size
 
-    if args.pcd_file:
-        grid_origin_m = np.array(list(map(float, args.grid_origin_m.split(','))))
-        # we expect that points are in global or vehicle coord system
-        # probably world and we use grid_origin for centering
-        occ = make_scene_from_pcd(
-            pcd_path=args.pcd_file,
-            grid_shape_vox=grid_shape_vox,
-            cell_size=args.cell_size,
-            grid_origin_m=grid_origin_m,
-        )
-    else:
-        print("- Generating default procedural scene.")
-        occ, _ = make_scene(
-            D_m=grid_dims_m[0], H_m=grid_dims_m[1], W_m=grid_dims_m[2],
-            cell_size=args.cell_size
-        )
+    grid_origin_m = np.array(list(map(float, args.grid_origin_m.split(','))))
+    # we expect that points are in global or vehicle coord system
+    # probably world and we use grid_origin for centering
+    occ = make_scene_from_pcd(
+        pcd_path=args.pcd_file,
+        grid_shape_vox=grid_shape_vox,
+        cell_size=args.cell_size,
+        grid_origin_m=grid_origin_m,
+    )
 
     start_ray_time = time.time()
     h_samples, v_samples = 900, 128
@@ -694,23 +643,22 @@ if __name__ == "__main__":
     )
     
     cluster = np.zeros_like(occ, dtype=np.uint8)
-    if not args.pcd_file:
-        # This cluster definition is tuned for the default procedural scene
-        z0, z1 = int(10 / args.cell_size), int(36 / args.cell_size)
-        y0, y1 = int(10 / args.cell_size), int(30 / args.cell_size)
-        x0, x1 = int(10 / args.cell_size), int(56 / args.cell_size)
-        cluster[z0:z1, y0:y1, x0:x1] = 1
+    # if not args.pcd_file:
+    #     # This cluster definition is tuned for the default procedural scene
+    #     z0, z1 = int(10 / args.cell_size), int(36 / args.cell_size)
+    #     y0, y1 = int(10 / args.cell_size), int(30 / args.cell_size)
+    #     x0, x1 = int(10 / args.cell_size), int(56 / args.cell_size)
+    #     cluster[z0:z1, y0:y1, x0:x1] = 1
 
-    # WARMUP
     warmup_result = get_visibility_grid(occ, sensor, dirs[:1], beam_config=beam_config)
 
     print("\n--- DEMO 1: Single Run (Visibility + FOV Grids) ---")
     start_time = time.time()
-    vis_grid = get_visibility_grid(
-        occ, sensor, dirs,
+    vis_grid = get_visibility_grid_batch(
+        [(occ, sensor)], dirs,
         max_range=40.0, cell_size=args.cell_size,
         beam_config=beam_config
-    )
+    )[0]
     full_time = time.time() - start_time
     print(f"- Grid Computation Time:   {full_time:.4f}s")
 
@@ -731,62 +679,7 @@ if __name__ == "__main__":
     plot_time = time.time() - start_plot_time
     print(f"- Plotting Time:           {plot_time:.4f}s")
 
-#     # --- DEMO 2: Single Run (Visibility-Only Grid) ---
-#     print("\n--- DEMO 2: Single Run (Visibility-Only Grid) ---")
-#     start_time = time.time()
-#     vis_only_grid, no_fov_grid = get_visibility_grid(
-#         occ, sensor, dirs,
-#         max_range=40.0, cell_size=args.cell_size,
-#         beam_config=beam_config, compute_fov_grid=False
-#     )
-#     vis_only_time = time.time() - start_time
-#     print(f"- Grid Computation Time:   {vis_only_time:.4f}s")
-# 
-#     start_time = time.time()
-#     any_vis_simple = get_cluster_visibility_status(vis_only_grid, no_fov_grid, cluster, mode=ClusterVisMode.ANY_VISIBLE)
-#     all_vis_simple = get_cluster_visibility_status(vis_only_grid, no_fov_grid, cluster, mode=ClusterVisMode.ALL_VISIBLE)
-#     simple_cluster_time = time.time() - start_time
-#     print(f"- Cluster Check Time:      {simple_cluster_time:.4f}s")
-#     print(f"  - Result (ANY_VISIBLE):  {any_vis_simple.name} (Note: OUT_OF_FOV not distinguishable from OCCLUDED)")
-#     print(f"  - Result (ALL_VISIBLE):  {all_vis_simple.name} (Note: OUT_OF_FOV not distinguishable from OCCLUDED)")
-# 
-#     # --- DEMO 3: Batch Processing ---
-#     print("\n--- DEMO 3: Batch Processing ---")
-#     batch_size = 20
-#     print(f"- Batch Size:              {batch_size}")
-#     
-#     # Batch with Vis + FOV
-#     start_time = time.time()
-#     batch_results_full = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=True)
-#     batch_grid_time = time.time() - start_time
-#     avg_batch_grid_time = batch_grid_time / batch_size
-#     print(f"- Grid Comp Time (Vis+FOV):{batch_grid_time:>8.4f}s (Avg: {avg_batch_grid_time:.4f}s per item)")
-#     
-#     # Batch with Vis-Only
-#     start_time = time.time()
-#     batch_results_vis_only = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=False)
-#     batch_vis_only_time = time.time() - start_time
-#     avg_batch_vis_only_time = batch_vis_only_time / batch_size
-#     print(f"- Grid Comp Time (Vis-Only):{batch_vis_only_time:>7.4f}s (Avg: {avg_batch_vis_only_time:.4f}s per item)")
-# 
-#     # Batch cluster check (using the full results)
-#     start_time = time.time()
-#     batch_items = [(vis_grid, fov_grid, cluster, ClusterVisMode.ANY_VISIBLE) for vis_grid, fov_grid in batch_results_full]
-#     batch_cluster_vis = get_cluster_visibility_status_batch(batch_items)
-#     batch_cluster_time = time.time() - start_time
-#     avg_batch_cluster_time = batch_cluster_time / batch_size
-#     print(f"- Cluster Check Time:      {batch_cluster_time:>8.4f}s (Avg: {avg_batch_cluster_time:.4f}s per item)")
-# 
-#     # --- Performance Summary ---
-#     print("\n======================= PERFORMANCE SUMMARY =======================")
-#     print(f"| {'Operation':<32} | {'Time (Single)':>15} | {'Time (Batch Avg)':>18} |")
-#     print(f"|{'-'*34}|{'-'*17}|{'-'*20}|")
-#     print(f"| Grid Computation (Vis + FOV)   | {full_time:>15.4f}s | {avg_batch_grid_time:>18.4f}s |")
-#     print(f"| Grid Computation (Vis-Only)    | {vis_only_time:>15.4f}s | {avg_batch_vis_only_time:>18.4f}s |")
-#     print(f"| Cluster Visibility Check       | {single_cluster_time:>15.4f}s | {avg_batch_cluster_time:>18.4f}s |")
-#     print("---------------------------------------------------------------------")
-#     print("=====================================================================")
-# 
+ 
     # --- DEMO 4: Interactive Web-Based 3D Visualization ---
     if args.plot_3d_web:
         plot_3d_scene_web(
