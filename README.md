@@ -94,6 +94,8 @@ python main.py --pcd_file sample.pcd --plot_3d_web && python -m http.server 8474
 
 ## Future Work
 
+- need to diffuse the (obstacle) pcd points
+
 - package, and better api
 - read pcd as input and calculate rays
 
