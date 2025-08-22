@@ -96,3 +96,6 @@ python main.py --pcd_file sample.pcd --plot_3d_web && python -m http.server 8474
 
 - package, and better api
 - read pcd as input and calculate rays
+
+- simplify
+- start with small example? 1 slice

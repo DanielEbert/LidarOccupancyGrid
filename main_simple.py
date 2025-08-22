@@ -122,7 +122,7 @@ def raycast_kernel(occ: NDArray[np.uint8], visibility_grid: NDArray[np.int32], s
     This uses a DDA voxel traversal algorithm (Amanatides & Woo, 1987).
     The `visibility_grid` is modified in place.
     """
-    D, H, W = occ.shape
+    W, D, H = occ.shape
     idx = cuda.grid(1)
     if idx >= dirs.shape[0]:
         return
@@ -171,9 +171,9 @@ def raycast_kernel(occ: NDArray[np.uint8], visibility_grid: NDArray[np.int32], s
     t = 0.0
     max_t = max_range
 
-    if occ[vz, vy, vx] != 0:
+    if occ[vx, vy, vz] != 0:
         return
-    visibility_grid[vz, vy, vx] = 1
+    visibility_grid[vx, vy, vz] = 1
 
     while t <= max_t:
         if tMaxX <= tMaxY and tMaxX <= tMaxZ:
@@ -192,10 +192,10 @@ def raycast_kernel(occ: NDArray[np.uint8], visibility_grid: NDArray[np.int32], s
         if vz < 0 or vz >= D or vy < 0 or vy >= H or vx < 0 or vx >= W:
             break
 
-        if occ[vz, vy, vx] != 0:
+        if occ[vx, vy, vz] != 0:
             break
 
-        visibility_grid[vz, vy, vx] = 1
+        visibility_grid[vx, vy, vz] = 1
 
 
 @cuda.jit(device=True)
@@ -257,11 +257,11 @@ def dilate_visibility_kernel(
         extra_vox_inflate: int,
         check_occ: bool,
 ) -> None:
-    D, H, W = in_vis.shape
-    vz, vy, vx = cuda.grid(3)
+    W, D, H = in_vis.shape
+    vx, vy, vz = cuda.grid(3)
     if vz >= D or vy >= H or vx >= W:
         return
-    if in_vis[vz, vy, vx] == 0:
+    if in_vis[vx, vy, vz] == 0:
         return
 
     sz, sy, sx = sensor_pos[0], sensor_pos[1], sensor_pos[2]
@@ -287,11 +287,11 @@ def dilate_visibility_kernel(
                     # into an obstacle, nor should we dilate THROUGH an obstacle.
                     if check_occ:
                         # Check that the destination is free AND the path to it is clear.
-                        if occ[z, y, x] == 0 and is_path_clear_device(occ, vz, vy, vx, z, y, x):
-                            out_vis[z, y, x] = 1
+                        if occ[x, y, z] == 0 and is_path_clear_device(occ, vz, vy, vx, z, y, x):
+                            out_vis[x, y, z] = 1
                     else:
                         # This is the FOV grid case, ignore occupancy.
-                        out_vis[z, y, x] = 1
+                        out_vis[x, y, z] = 1
 
 def get_visibility_grid(
         occ: NDArray[np.uint8],
@@ -303,6 +303,7 @@ def get_visibility_grid(
         compute_fov_grid: bool = True,
 ) -> tuple[NDArray[np.int32], NDArray[np.int32] | None]:
     """Computes the visibility grid and, optionally, the Field-of-View (FOV) grid."""
+
     visibility_grid = np.zeros_like(occ, dtype=np.int32)
     fov_grid = np.zeros_like(occ, dtype=np.int32) if compute_fov_grid else None
 
@@ -315,10 +316,6 @@ def get_visibility_grid(
     blocks = (dirs.shape[0] + threads - 1) // threads
 
     raycast_kernel[blocks, threads](d_occ, d_visibility_grid, d_sensor, d_dirs, float32(max_range), float32(cell_size))
-
-    if compute_fov_grid:
-        d_fov_grid = cuda.to_device(fov_grid)
-        fov_kernel[blocks, threads](d_fov_grid, d_sensor, d_dirs, float32(max_range), float32(cell_size))
 
     if beam_config.use_dilation:
         d_dilated_visibility_grid = cuda.device_array_like(d_visibility_grid)
@@ -335,20 +332,8 @@ def get_visibility_grid(
             True  # check_occ = True
         )
         d_dilated_visibility_grid.copy_to_host(visibility_grid)
-        
-        if compute_fov_grid:
-            d_dilated_fov_grid = cuda.device_array_like(d_fov_grid)
-            dilate_visibility_kernel[bpg, TPB](
-                d_fov_grid, d_dilated_fov_grid, d_occ, d_sensor,
-                float32(cell_size), float32(beam_config.divergence_deg),
-                float32(beam_config.min_radius_m), int(beam_config.extra_vox_inflate),
-                False  # check_occ = False
-            )
-            d_dilated_fov_grid.copy_to_host(fov_grid)
     else:
         d_visibility_grid.copy_to_host(visibility_grid)
-        if compute_fov_grid:
-            d_fov_grid.copy_to_host(fov_grid)
 
     return visibility_grid, fov_grid
 
@@ -379,10 +364,10 @@ def pos_to_cell_idx(d: float, h: float, w: float, cell_size: float) -> tuple[int
 
 
 def make_scene_from_pcd(
-    pcd_path: Path,
-    grid_shape_vox: tuple[int, int, int],
-    cell_size: float,
-    grid_origin_m: Position,
+        pcd_path: Path,
+        grid_shape_vox: tuple[int, int, int],
+        cell_size: float,
+        grid_origin_m: Position,
 ) -> NDArray[np.uint8]:
     """Creates an occupancy grid from a PCD file.
 
@@ -438,7 +423,7 @@ def make_scene_from_pcd(
     z_indices = valid_indices_xyz[:, 2]
     y_indices = valid_indices_xyz[:, 1]
     x_indices = valid_indices_xyz[:, 0]
-    occ[z_indices, y_indices, x_indices] = 1
+    occ[x_indices, y_indices, z_indices] = 1
 
     return occ
 
@@ -611,10 +596,10 @@ def plot_slice(
         out_path: str = "example_result.png",
 ) -> None:
     """Plots a 2D slice of the combined occupancy, visibility, FOV, and cluster grids."""
-    occ_slice = occ[int(z_idx)]
-    vis_slice = vis[int(z_idx)]
-    fov_slice = fov[int(z_idx)]
-    cluster_slice = cluster[int(z_idx)]
+    occ_slice = occ[:, :, int(z_idx)]
+    vis_slice = vis[:, :, int(z_idx)]
+    fov_slice = fov[int(z_idx)].T
+    cluster_slice = cluster[:, :, int(z_idx)]
 
     # 0: Empty/Unseen (white)
     # 1: Occupied (black)
@@ -691,7 +676,7 @@ def get_cluster_visibility_status(
     Returns:
         The visibility status of the cluster.
     """
-    z_coords, y_coords, x_coords = np.nonzero(cluster_mask > 0)
+    x_coords, y_coords, z_coords = np.nonzero(cluster_mask > 0)
     num_voxels = z_coords.shape[0]
     if num_voxels == 0:
         return ClusterVisibility.OUT_OF_FOV # No points to check
@@ -703,15 +688,15 @@ def get_cluster_visibility_status(
     else:
         zv, yv, xv = z_coords, y_coords, x_coords
 
-    D, H, W = visibility_grid.shape
-    valid_indices = (zv < D) & (yv < H) & (xv < W)
+    W, D, H = visibility_grid.shape
+    valid_indices = (xv < W) & (yv < D) & (zv < H)
     if not np.any(valid_indices):
         return ClusterVisibility.OUT_OF_FOV # All points outside grid bounds
     
-    zv, yv, xv = zv[valid_indices], yv[valid_indices], xv[valid_indices]
+    xv, yv, zv = xv[valid_indices], yv[valid_indices], zv[valid_indices]
     
-    visibility_flags = visibility_grid[zv, yv, xv].astype(bool)
-    
+    visibility_flags = visibility_grid[xv, yv, zv].astype(bool)
+
     # If FOV grid is not provided, we can't distinguish between occluded and out-of-fov.
     if fov_grid is None:
         if np.any(visibility_flags):
@@ -719,7 +704,7 @@ def get_cluster_visibility_status(
         else:
             return ClusterVisibility.OCCLUDED
 
-    fov_flags = fov_grid[zv, yv, xv].astype(bool)
+    fov_flags = fov_grid[xv, yv, zv].astype(bool)
 
     if mode == ClusterVisMode.ANY_VISIBLE:
         if np.any(visibility_flags):
@@ -894,6 +879,7 @@ if __name__ == "__main__":
     print(f"- Grid Computation Time:   {full_time:.4f}s")
 
     start_time = time.time()
+    # TODO: vis grid x y z 
     any_vis = get_cluster_visibility_status(vis_grid, fov_grid, cluster, mode=ClusterVisMode.ANY_VISIBLE)
     all_vis = get_cluster_visibility_status(vis_grid, fov_grid, cluster, mode=ClusterVisMode.ALL_VISIBLE)
     single_cluster_time = time.time() - start_time
@@ -904,68 +890,69 @@ if __name__ == "__main__":
     start_plot_time = time.time()
     print("- Plotting slices (view slice*.png for results)...")
     if fov_grid is not None:
-        for z_idx in range(96, 108):
+        for z_idx in range(100, 101):
+        # for z_idx in range(96, 108):
             if 0 <= z_idx < occ.shape[0]:
                 plot_slice(occ, vis_grid, fov_grid, cluster, z_idx=z_idx, sensor_zyx=sensor, out_path=f"slice_{z_idx}.png")
     plot_time = time.time() - start_plot_time
     print(f"- Plotting Time:           {plot_time:.4f}s")
 
-    # --- DEMO 2: Single Run (Visibility-Only Grid) ---
-    print("\n--- DEMO 2: Single Run (Visibility-Only Grid) ---")
-    start_time = time.time()
-    vis_only_grid, no_fov_grid = get_visibility_grid(
-        occ, sensor, dirs,
-        max_range=40.0, cell_size=args.cell_size,
-        beam_config=beam_config, compute_fov_grid=False
-    )
-    vis_only_time = time.time() - start_time
-    print(f"- Grid Computation Time:   {vis_only_time:.4f}s")
-
-    start_time = time.time()
-    any_vis_simple = get_cluster_visibility_status(vis_only_grid, no_fov_grid, cluster, mode=ClusterVisMode.ANY_VISIBLE)
-    all_vis_simple = get_cluster_visibility_status(vis_only_grid, no_fov_grid, cluster, mode=ClusterVisMode.ALL_VISIBLE)
-    simple_cluster_time = time.time() - start_time
-    print(f"- Cluster Check Time:      {simple_cluster_time:.4f}s")
-    print(f"  - Result (ANY_VISIBLE):  {any_vis_simple.name} (Note: OUT_OF_FOV not distinguishable from OCCLUDED)")
-    print(f"  - Result (ALL_VISIBLE):  {all_vis_simple.name} (Note: OUT_OF_FOV not distinguishable from OCCLUDED)")
-
-    # --- DEMO 3: Batch Processing ---
-    print("\n--- DEMO 3: Batch Processing ---")
-    batch_size = 20
-    print(f"- Batch Size:              {batch_size}")
-    
-    # Batch with Vis + FOV
-    start_time = time.time()
-    batch_results_full = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=True)
-    batch_grid_time = time.time() - start_time
-    avg_batch_grid_time = batch_grid_time / batch_size
-    print(f"- Grid Comp Time (Vis+FOV):{batch_grid_time:>8.4f}s (Avg: {avg_batch_grid_time:.4f}s per item)")
-    
-    # Batch with Vis-Only
-    start_time = time.time()
-    batch_results_vis_only = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=False)
-    batch_vis_only_time = time.time() - start_time
-    avg_batch_vis_only_time = batch_vis_only_time / batch_size
-    print(f"- Grid Comp Time (Vis-Only):{batch_vis_only_time:>7.4f}s (Avg: {avg_batch_vis_only_time:.4f}s per item)")
-
-    # Batch cluster check (using the full results)
-    start_time = time.time()
-    batch_items = [(vis_grid, fov_grid, cluster, ClusterVisMode.ANY_VISIBLE) for vis_grid, fov_grid in batch_results_full]
-    batch_cluster_vis = get_cluster_visibility_status_batch(batch_items)
-    batch_cluster_time = time.time() - start_time
-    avg_batch_cluster_time = batch_cluster_time / batch_size
-    print(f"- Cluster Check Time:      {batch_cluster_time:>8.4f}s (Avg: {avg_batch_cluster_time:.4f}s per item)")
-
-    # --- Performance Summary ---
-    print("\n======================= PERFORMANCE SUMMARY =======================")
-    print(f"| {'Operation':<32} | {'Time (Single)':>15} | {'Time (Batch Avg)':>18} |")
-    print(f"|{'-'*34}|{'-'*17}|{'-'*20}|")
-    print(f"| Grid Computation (Vis + FOV)   | {full_time:>15.4f}s | {avg_batch_grid_time:>18.4f}s |")
-    print(f"| Grid Computation (Vis-Only)    | {vis_only_time:>15.4f}s | {avg_batch_vis_only_time:>18.4f}s |")
-    print(f"| Cluster Visibility Check       | {single_cluster_time:>15.4f}s | {avg_batch_cluster_time:>18.4f}s |")
-    print("---------------------------------------------------------------------")
-    print("=====================================================================")
-
+#     # --- DEMO 2: Single Run (Visibility-Only Grid) ---
+#     print("\n--- DEMO 2: Single Run (Visibility-Only Grid) ---")
+#     start_time = time.time()
+#     vis_only_grid, no_fov_grid = get_visibility_grid(
+#         occ, sensor, dirs,
+#         max_range=40.0, cell_size=args.cell_size,
+#         beam_config=beam_config, compute_fov_grid=False
+#     )
+#     vis_only_time = time.time() - start_time
+#     print(f"- Grid Computation Time:   {vis_only_time:.4f}s")
+# 
+#     start_time = time.time()
+#     any_vis_simple = get_cluster_visibility_status(vis_only_grid, no_fov_grid, cluster, mode=ClusterVisMode.ANY_VISIBLE)
+#     all_vis_simple = get_cluster_visibility_status(vis_only_grid, no_fov_grid, cluster, mode=ClusterVisMode.ALL_VISIBLE)
+#     simple_cluster_time = time.time() - start_time
+#     print(f"- Cluster Check Time:      {simple_cluster_time:.4f}s")
+#     print(f"  - Result (ANY_VISIBLE):  {any_vis_simple.name} (Note: OUT_OF_FOV not distinguishable from OCCLUDED)")
+#     print(f"  - Result (ALL_VISIBLE):  {all_vis_simple.name} (Note: OUT_OF_FOV not distinguishable from OCCLUDED)")
+# 
+#     # --- DEMO 3: Batch Processing ---
+#     print("\n--- DEMO 3: Batch Processing ---")
+#     batch_size = 20
+#     print(f"- Batch Size:              {batch_size}")
+#     
+#     # Batch with Vis + FOV
+#     start_time = time.time()
+#     batch_results_full = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=True)
+#     batch_grid_time = time.time() - start_time
+#     avg_batch_grid_time = batch_grid_time / batch_size
+#     print(f"- Grid Comp Time (Vis+FOV):{batch_grid_time:>8.4f}s (Avg: {avg_batch_grid_time:.4f}s per item)")
+#     
+#     # Batch with Vis-Only
+#     start_time = time.time()
+#     batch_results_vis_only = get_visibility_grid_batch([(occ, sensor) for _ in range(batch_size)], dirs, max_range=40.0, cell_size=args.cell_size, beam_config=beam_config, compute_fov_grid=False)
+#     batch_vis_only_time = time.time() - start_time
+#     avg_batch_vis_only_time = batch_vis_only_time / batch_size
+#     print(f"- Grid Comp Time (Vis-Only):{batch_vis_only_time:>7.4f}s (Avg: {avg_batch_vis_only_time:.4f}s per item)")
+# 
+#     # Batch cluster check (using the full results)
+#     start_time = time.time()
+#     batch_items = [(vis_grid, fov_grid, cluster, ClusterVisMode.ANY_VISIBLE) for vis_grid, fov_grid in batch_results_full]
+#     batch_cluster_vis = get_cluster_visibility_status_batch(batch_items)
+#     batch_cluster_time = time.time() - start_time
+#     avg_batch_cluster_time = batch_cluster_time / batch_size
+#     print(f"- Cluster Check Time:      {batch_cluster_time:>8.4f}s (Avg: {avg_batch_cluster_time:.4f}s per item)")
+# 
+#     # --- Performance Summary ---
+#     print("\n======================= PERFORMANCE SUMMARY =======================")
+#     print(f"| {'Operation':<32} | {'Time (Single)':>15} | {'Time (Batch Avg)':>18} |")
+#     print(f"|{'-'*34}|{'-'*17}|{'-'*20}|")
+#     print(f"| Grid Computation (Vis + FOV)   | {full_time:>15.4f}s | {avg_batch_grid_time:>18.4f}s |")
+#     print(f"| Grid Computation (Vis-Only)    | {vis_only_time:>15.4f}s | {avg_batch_vis_only_time:>18.4f}s |")
+#     print(f"| Cluster Visibility Check       | {single_cluster_time:>15.4f}s | {avg_batch_cluster_time:>18.4f}s |")
+#     print("---------------------------------------------------------------------")
+#     print("=====================================================================")
+# 
     # --- DEMO 4: Interactive Web-Based 3D Visualization ---
     if args.plot_3d_web:
         plot_3d_scene_web(
