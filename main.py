@@ -211,7 +211,7 @@ def dilate_visibility_kernel(
 ) -> None:
     W, D, H = in_vis.shape
     vx, vy, vz = cuda.grid(3)
-    if vx >= W or vy >= D or vy >= H:
+    if vx >= W or vy >= D or vz >= H:
         return
     if in_vis[vx, vy, vz] == 0:
         return
@@ -276,6 +276,7 @@ def get_visibility_grid_batch(occ_sensor_list, dirs, max_range=100.0,
 
     for i, (occ, sensor) in enumerate(occ_sensor_list):
         stream = streams[i % len(streams)]
+        # TODO: not parallel, we would need to pass stream to all numba functions
         with stream.auto_synchronize():
             result = get_visibility_grid(occ, sensor, dirs, max_range, 
                                        cell_size, beam_config)
@@ -293,17 +294,15 @@ def pos_to_cell_idx(d: float, h: float, w: float, cell_size: float) -> tuple[int
 def make_scene_from_pcd(
         pcd_path: Path,
         grid_shape_vox: tuple[int, int, int],
+        center_cell: NDArray[np.float32],
         cell_size: float,
-        grid_origin_m: NDArray[np.float32],
 ) -> NDArray[np.uint8]:
     pc = pypcd4.PointCloud.from_path(pcd_path)
     occ = np.zeros(grid_shape_vox, dtype=np.uint8)
     points_xyz = pc.numpy()[:, :3]
-    points_xyz[:, 2] += 2  # input pcd was shifted down 2 meters. TODO: later no need
     print(f"Loaded {points_xyz.shape[0]} points.")
 
-    points_relative_to_origin_m = points_xyz - grid_origin_m
-    indices_xyz = np.floor(points_relative_to_origin_m / cell_size).astype(int)
+    indices_xyz = np.floor(points_xyz / cell_size).astype(int) + center_cell
 
     W, D, H = grid_shape_vox
     valid_mask = (
@@ -359,7 +358,7 @@ def sample_fov_dirs(
 
 def plot_3d_scene_web(
     occ: NDArray[np.uint8],
-    sensor_zyx: Position,
+    sensor: Position,
     dirs: NDArray[np.float32],
     max_range: float,
     num_rays_to_plot: int = 50,
@@ -369,14 +368,13 @@ def plot_3d_scene_web(
     # The simulation uses (z, y, x) numpy indexing.
     # Plotly uses a standard Cartesian (x, y, z) coordinate system.
     # We must consistently swap the axes when creating plotable objects.
+    sensor = np.array(sensor)
 
     plot_data = []
 
     # 1. Trace for the occupied voxels (PCD)
-    occ_indices_zyx = np.argwhere(occ == 1)
-    if occ_indices_zyx.size > 0:
-        # Swap axes from (z, y, x) to (x, y, z) for plotting
-        occ_indices_xyz = occ_indices_zyx[:, ::-1]
+    occ_indices_xyz = np.argwhere(occ == 1)
+    if occ_indices_xyz.size > 0:
         pcd_trace = go.Scatter3d(
             x=occ_indices_xyz[:, 0], y=occ_indices_xyz[:, 1], z=occ_indices_xyz[:, 2],
             mode='markers',
@@ -387,9 +385,8 @@ def plot_3d_scene_web(
 
     # 2. Trace for the sensor position
     # Swap axes from (z, y, x) to (x, y, z) for plotting
-    sensor_xyz = np.array([sensor_zyx[2], sensor_zyx[1], sensor_zyx[0]])
     sensor_trace = go.Scatter3d(
-        x=[sensor_xyz[0]], y=[sensor_xyz[1]], z=[sensor_xyz[2]],
+        x=[sensor[0]], y=[sensor[1]], z=[sensor[2]],
         mode='markers',
         marker=dict(size=8, color='yellow', symbol='diamond', line=dict(color='black', width=2)),
         name='Sensor Position'
@@ -407,8 +404,8 @@ def plot_3d_scene_web(
     # and separate the line segments with `None` values.
     ray_x, ray_y, ray_z = [], [], []
     for i in range(num_rays_to_plot):
-        start_point = sensor_xyz
-        end_point = sensor_xyz + sampled_dirs_xyz[i] * max_range
+        start_point = sensor
+        end_point = sensor + sampled_dirs_xyz[i] * max_range
         
         ray_x.extend([start_point[0], end_point[0], None])
         ray_y.extend([start_point[1], end_point[1], None])
@@ -446,13 +443,19 @@ def plot_slice(
         vis: NDArray[np.int32],
         cluster: NDArray[np.uint8],
         z_idx: int | float,
-        sensor_zyx: NDArray[np.float32],
+        sensor_xyz: NDArray[np.float32],
         out_path: str = "example_result.png",
 ) -> None:
     """Plots a 2D slice of the combined occupancy, visibility, and cluster grids."""
     occ_slice = occ[:, :, int(z_idx)]
     vis_slice = vis[:, :, int(z_idx)]
     cluster_slice = cluster[:, :, int(z_idx)]
+    
+    # Transform slices for correct orientation: +X right, +Y up
+    # Transpose to swap X and Y, then flip vertically to make +Y point up
+    occ_slice = np.flipud(occ_slice.T)
+    vis_slice = np.flipud(vis_slice.T)
+    cluster_slice = np.flipud(cluster_slice.T)
 
     # 0: Empty/Unseen (white)
     # 1: Occupied (black)
@@ -486,10 +489,16 @@ def plot_slice(
     fig, ax = plt.subplots(figsize=(20, 20))
     img = ax.imshow(merged_grid, cmap=cmap, norm=norm, origin="lower")
 
-    ax.plot(sensor_zyx[0], sensor_zyx[1], 'y*', markersize=20, markeredgecolor='black', label='Sensor Origin')
+    # Adjust sensor coordinates for new orientation
+    # After transpose and flip: Y becomes horizontal axis, X becomes vertical (flipped)
+    sensor_x_plot = sensor_xyz[1]  # Y coordinate becomes horizontal position
+    sensor_y_plot = merged_grid.shape[0] - 1 - sensor_xyz[0]  # X coordinate becomes vertical (flipped)
+    ax.plot(sensor_x_plot, sensor_y_plot, 'y*', markersize=20, markeredgecolor='black', label='Sensor Origin')
     ax.legend()
     
     ax.set_title(f"Occupancy, Visibility & Cluster Status (z={int(z_idx)})")
+    ax.set_xlabel('X (rightward)')
+    ax.set_ylabel('Y (upward)')
     
     cbar = fig.colorbar(img, ax=ax, fraction=0.046, pad=0.04, ticks=np.arange(7))
     cbar.ax.set_yticklabels(['Empty', 'Occupied', 'In FOV Free', 'Visible Free', 'Cluster (Out of FOV)', 'Cluster (Occluded)', 'Cluster (Visible)'])
@@ -588,12 +597,8 @@ if __name__ == "__main__":
         help="Grid dimensions in meters as 'Width,Depth,Height' (X,Y,Z)."
     )
     parser.add_argument(
-        "--sensor_pos_m", type=str, default="20,20,20",
+        "--sensor_pos_m", type=str, default="0,0,0",
         help="Sensor position in world coordinates (X,Y,Z) in meters."
-    )
-    parser.add_argument(
-        "--grid_origin_m", type=str, default="-20,-20,-20",
-        help="World coordinate (x,y,z) in meters that maps to grid voxel (0,0,0). Used only with --pcd_file."
     )
     parser.add_argument(
         "--cell_size", type=float, default=0.2,
@@ -610,16 +615,17 @@ if __name__ == "__main__":
     grid_dims_m = tuple(map(float, args.grid_dims_m.split(',')))
     grid_shape_vox = pos_to_cell_idx(grid_dims_m[0], grid_dims_m[1], grid_dims_m[2], args.cell_size)
 
-    sensor = np.array(list(map(float, args.sensor_pos_m.split(',')))) / args.cell_size
+    center_cell = np.array(grid_shape_vox) // 2
+    sensor = (np.array(list(map(float, args.sensor_pos_m.split(',')))) / args.cell_size).astype(int)
+    sensor += center_cell
+    print(f'{sensor=}')
 
-    grid_origin_m = np.array(list(map(float, args.grid_origin_m.split(','))))
-    # we expect that points are in global or vehicle coord system
-    # probably world and we use grid_origin for centering
+    # currently we expect sensor at 0,0
     occ = make_scene_from_pcd(
         pcd_path=args.pcd_file,
         grid_shape_vox=grid_shape_vox,
+        center_cell=center_cell,
         cell_size=args.cell_size,
-        grid_origin_m=grid_origin_m,
     )
 
     start_ray_time = time.time()
@@ -643,12 +649,24 @@ if __name__ == "__main__":
     )
     
     cluster = np.zeros_like(occ, dtype=np.uint8)
+    x_center, y_center, z_center = 70, 100, 100
+    cluster_size = 20
+    half_size = cluster_size // 2
+    
+    x0 = max(0, x_center - half_size)
+    x1 = min(cluster.shape[0], x_center + half_size)
+    y0 = max(0, y_center - half_size)
+    y1 = min(cluster.shape[1], y_center + half_size)
+    z0 = max(0, z_center)
+    z1 = min(cluster.shape[2], z_center + 1)
+    
+    cluster[x0:x1, y0:y1, z0:z1] = 1
     # if not args.pcd_file:
     #     # This cluster definition is tuned for the default procedural scene
     #     z0, z1 = int(10 / args.cell_size), int(36 / args.cell_size)
     #     y0, y1 = int(10 / args.cell_size), int(30 / args.cell_size)
     #     x0, x1 = int(10 / args.cell_size), int(56 / args.cell_size)
-    #     cluster[z0:z1, y0:y1, x0:x1] = 1
+    #     cluster[x0:x1, y0:y1, z0:z1] = 1
 
     warmup_result = get_visibility_grid(occ, sensor, dirs[:1], beam_config=beam_config)
 
@@ -672,10 +690,9 @@ if __name__ == "__main__":
 
     start_plot_time = time.time()
     print("- Plotting slices (view slice*.png for results)...")
-    for z_idx in range(100, 101):
-    # for z_idx in range(96, 108):
-        if 0 <= z_idx < occ.shape[0]:
-            plot_slice(occ, vis_grid, cluster, z_idx=z_idx, sensor_zyx=sensor, out_path=f"slice_{z_idx}.png")
+    for z_idx in [95, 100]:
+        if 0 <= z_idx < occ.shape[2]:
+            plot_slice(occ, vis_grid, cluster, z_idx=z_idx, sensor_xyz=sensor, out_path=f"slice_{z_idx}.png")
     plot_time = time.time() - start_plot_time
     print(f"- Plotting Time:           {plot_time:.4f}s")
 
@@ -684,7 +701,7 @@ if __name__ == "__main__":
     if args.plot_3d_web:
         plot_3d_scene_web(
             occ=occ,
-            sensor_zyx=sensor,
+            sensor=sensor,
             dirs=dirs,
             max_range=40.0, # Use the same max_range as Demo 1
         )
