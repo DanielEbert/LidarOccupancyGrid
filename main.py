@@ -358,18 +358,19 @@ def sample_fov_dirs(
 
 def plot_3d_scene_web(
     occ: NDArray[np.uint8],
+    vis_grid: NDArray[np.uint8],
     sensor: Position,
     dirs: NDArray[np.float32],
     max_range: float,
     num_rays_to_plot: int = 50,
     out_path: str = "scene_3d_view.html",
 ) -> None:
-    """Creates and saves an interactive 3D web-based view of the scene using Plotly."""
-    # The simulation uses (z, y, x) numpy indexing.
-    # Plotly uses a standard Cartesian (x, y, z) coordinate system.
-    # We must consistently swap the axes when creating plotable objects.
+    """
+    Creates and saves an interactive 3D web-based view of the scene using Plotly.
+    Includes a slider to select and view a specific Z-slice of the visibility grid.
+    The selected z_slice index is printed to the plot title and slider label.
+    """
     sensor = np.array(sensor)
-
     plot_data = []
 
     # 1. Trace for the occupied voxels (PCD)
@@ -378,13 +379,12 @@ def plot_3d_scene_web(
         pcd_trace = go.Scatter3d(
             x=occ_indices_xyz[:, 0], y=occ_indices_xyz[:, 1], z=occ_indices_xyz[:, 2],
             mode='markers',
-            marker=dict(size=2, color='black', opacity=0.7),
+            marker=dict(size=3, color='black', opacity=0.7, sizemode='diameter'),
             name='Occupied Voxels (PCD)'
         )
         plot_data.append(pcd_trace)
 
     # 2. Trace for the sensor position
-    # Swap axes from (z, y, x) to (x, y, z) for plotting
     sensor_trace = go.Scatter3d(
         x=[sensor[0]], y=[sensor[1]], z=[sensor[2]],
         mode='markers',
@@ -394,14 +394,11 @@ def plot_3d_scene_web(
     plot_data.append(sensor_trace)
 
     # 3. Trace for the FOV rays
-    # Subsample the rays to avoid creating a huge HTML file and cluttering the view
     rng = np.random.default_rng(0)
     num_rays_to_plot = min(num_rays_to_plot, dirs.shape[0])
     ray_indices = rng.choice(dirs.shape[0], size=num_rays_to_plot, replace=False)
-    sampled_dirs_xyz = dirs[ray_indices] # Dirs are already in (x, y, z)
+    sampled_dirs_xyz = dirs[ray_indices]
 
-    # To draw many separate lines efficiently in Plotly, we build a single trace
-    # and separate the line segments with `None` values.
     ray_x, ray_y, ray_z = [], [], []
     for i in range(num_rays_to_plot):
         start_point = sensor
@@ -419,24 +416,77 @@ def plot_3d_scene_web(
     )
     plot_data.append(ray_trace)
 
+    # Store the number of static traces that are always visible
+    num_static_traces = len(plot_data)
+
+    # 4. Traces for each Z-slice of the visibility grid
+    vis_indices_xyz = np.argwhere(vis_grid == 1)
+    max_z = occ.shape[2]
+    
+    has_visible_voxels = vis_indices_xyz.size > 0
+    initial_slice_idx = min(int(sensor[2]), max_z - 1) if max_z > 0 else 0
+
+    if has_visible_voxels:
+        for z_idx in range(max_z):
+            vis_slice_indices_xyz = vis_indices_xyz[vis_indices_xyz[:, 2] == z_idx]
+            slice_trace = go.Scatter3d(
+                x=vis_slice_indices_xyz[:, 0], y=vis_slice_indices_xyz[:, 1], z=vis_slice_indices_xyz[:, 2],
+                mode='markers',
+                marker=dict(size=6, color='green', opacity=0.7, sizemode='diameter'),
+                name=f'Visible Slice (Z={z_idx})',
+                visible=(z_idx == initial_slice_idx)
+            )
+            plot_data.append(slice_trace)
+
     fig = go.Figure(data=plot_data)
+    
+    # Create slider steps only if there are slices to show
+    steps = []
+    if has_visible_voxels:
+        for z_idx in range(max_z):
+            visibility_mask = [True] * num_static_traces + [False] * max_z
+            visibility_mask[num_static_traces + z_idx] = True
+            
+            step = dict(
+                method="update",
+                args=[{"visible": visibility_mask},
+                      {"title": f"3D Scene Visualization (Z-Slice: {z_idx})"}],
+                label=str(z_idx)
+            )
+            steps.append(step)
+
+    sliders = [dict(
+        active=initial_slice_idx,
+        currentvalue={"prefix": "Z-Slice: "},
+        pad={"t": 50},
+        steps=steps
+    )]
+
     fig.update_layout(
-        title='3D Scene Visualization',
+        title=f'3D Scene Visualization (Z-Slice: {initial_slice_idx})',
         scene=dict(
             xaxis_title='X',
             yaxis_title='Y',
             zaxis_title='Z',
             aspectratio=dict(x=1, y=1, z=1),
-            aspectmode='data', # Ensures proportions are correct
+            aspectmode='data',
             camera_eye=dict(x=1.5, y=1.5, z=1.5)
         ),
-        legend_orientation="h"
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5
+        ),
+        margin=dict(b=150),
+        sliders=sliders if has_visible_voxels else []
     )
 
     print(f"\n[ 3D VISUALIZATION ]")
     print(f"- Saving interactive 3D scene to: {out_path}")
     fig.write_html(out_path)
-    print("-  -> Open this file in a web browser to view the scene.")
+    print("-  -> Open this file in a web browser to view the scene and use the Z-slice slider.")
 
 def plot_slice(
         occ: NDArray[np.uint8],
@@ -701,6 +751,7 @@ if __name__ == "__main__":
     if args.plot_3d_web:
         plot_3d_scene_web(
             occ=occ,
+            vis_grid=vis_grid,
             sensor=sensor,
             dirs=dirs,
             max_range=40.0, # Use the same max_range as Demo 1
